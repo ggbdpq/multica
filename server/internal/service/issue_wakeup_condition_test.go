@@ -220,7 +220,7 @@ func TestWakeupConditionPullRequestChecksCoversVCSProviders(t *testing.T) {
 	f, s, issue, agent := conditionFixture(t)
 	ctx := context.Background()
 	var pr, connection string
-	if err := f.Pool.QueryRow(ctx, `INSERT INTO vcs_pull_request(workspace_id,connection_id,provider,repo_owner,repo_name,pr_number,title,state,html_url,head_sha,pr_created_at,pr_updated_at)
+	if err := f.Pool.QueryRow(ctx, `INSERT INTO vcs_pull_request(workspace_id,connection_id,provider,repo_owner,repo_name,pr_number,title,state,html_url,pr_created_at,pr_updated_at,head_sha)
 		VALUES($1,gen_random_uuid(),'forgejo','selfhosted','wakeup-test',(extract(epoch from clock_timestamp())*1000)::bigint % 100000,'PR','open','https://forgejo.example.test/pr',now(),now(),'aaa') RETURNING id, connection_id`, f.WorkspaceID).Scan(&pr, &connection); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestWakeupConditionPullRequestMergedCoversVCSProviders(t *testing.T) {
 	f, s, issue, agent := conditionFixture(t)
 	ctx := context.Background()
 	var pr string
-	if err := f.Pool.QueryRow(ctx, `INSERT INTO vcs_pull_request(workspace_id,connection_id,provider,repo_owner,repo_name,pr_number,title,state,html_url,head_sha,pr_created_at,pr_updated_at)
+	if err := f.Pool.QueryRow(ctx, `INSERT INTO vcs_pull_request(workspace_id,connection_id,provider,repo_owner,repo_name,pr_number,title,state,html_url,pr_created_at,pr_updated_at,head_sha)
 		VALUES($1,gen_random_uuid(),'gitea','selfhosted','wakeup-test',(extract(epoch from clock_timestamp())*1000)::bigint % 100000,'PR','open','https://gitea.example.test/pr',now(),now(),'ccc') RETURNING id`, f.WorkspaceID).Scan(&pr); err != nil {
 		t.Fatal(err)
 	}
