@@ -379,6 +379,11 @@ func TestIssueWakeupRetryOfDisabledOrEditedRuleIsNotCreated(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// 失败才走 retry 路径：parent 必须先落 failed，否则它仍占着
+			// (issue_id, agent_id) 的 queued/dispatched 部分唯一索引，retry
+			// 会撞 ON CONFLICT DO NOTHING 得到 ErrNoRows——那是槽位冲突的
+			// ErrNoRows，不是守卫的（M4 假绿教训）。
+			f.Exec(t, "UPDATE agent_task_queue SET status='failed',completed_at=now() WHERE id=$1", task.ID)
 			mutate(f.Fixture, w.ID)
 			if _, err := f.q.CreateRetryTask(ctx, db.CreateRetryTaskParams{ID: task.ID}); !errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("retry of a rule that can never be claimed again: want pgx.ErrNoRows, got %v", err)
