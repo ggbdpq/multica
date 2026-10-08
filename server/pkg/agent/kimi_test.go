@@ -1623,6 +1623,39 @@ func TestScanKimiMainTurnFailureFlipsOnFailedTerminalEvent(t *testing.T) {
 	}
 }
 
+// TestScanKimiMainTurnFailureSanitizesWireDiagnostic covers the review on
+// #9057: kimi's diagnostic is provider-authored text, and a JSON credential
+// embedded in it (request={"api_key":...}) survives both the raw string and
+// the shared redact.Text — the diagnostic must take the same
+// sanitizeAgentDiagnostic pass as every child-process diagnostic that
+// reaches Result.Error.
+func TestScanKimiMainTurnFailureSanitizesWireDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	now := time.Now()
+	const fakeSecret = "review-only-fake-secret"
+	writeKimiWireLog(t, home, "session_secret", "main",
+		kimiWireTurnEndedLine("failed",
+			`request={"api_key":"`+fakeSecret+`"} while calling https://api.kimi.com`,
+			now),
+	)
+
+	detail, failed := scanKimiMainTurnFailure(kimiUsageScan{
+		startTime: now.Add(-time.Minute), kimiHome: home,
+		sessionID: "session_secret", fallbackModel: "unknown",
+	})
+	if !failed {
+		t.Fatal("expected the failed main-agent terminal event to be reported")
+	}
+	if strings.Contains(detail, fakeSecret) {
+		t.Errorf("secret leaked through the wire diagnostic: %q", detail)
+	}
+	if !strings.Contains(detail, `api_key":"[REDACTED]"`) {
+		t.Errorf("expected the JSON secret field redacted, got %q", detail)
+	}
+}
+
 // TestScanKimiMainTurnFailureIgnoresHealthyStaleAndDelegated guards the flip
 // against false positives: a successful main turn stays completed, a failed
 // record from a previous task on a resumed session is outside the turn
@@ -1656,6 +1689,35 @@ func TestScanKimiMainTurnFailureIgnoresHealthyStaleAndDelegated(t *testing.T) {
 	}
 }
 
+// TestScanKimiMainTurnFailureReadsPastOversizedRecord covers the review on
+// #9057: newAgentStreamScanner stops for good at a line beyond
+// agentStreamMaxLineBytes and the old scan loop never checked scanner.Err(),
+// so a valid but oversized context.append record ahead of the terminal event
+// hid the failed outcome and kept the run completed. The scan must discard
+// the oversized record and keep reading.
+func TestScanKimiMainTurnFailureReadsPastOversizedRecord(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	now := time.Now()
+	oversized := `{"type":"context.append","content":"` + strings.Repeat("x", agentStreamMaxLineBytes) + `"}`
+	writeKimiWireLog(t, home, "session_big", "main",
+		oversized,
+		kimiWireTurnEndedLine("failed", "boom after the oversized record", now),
+	)
+
+	detail, failed := scanKimiMainTurnFailure(kimiUsageScan{
+		startTime: now.Add(-time.Minute), kimiHome: home,
+		sessionID: "session_big", fallbackModel: "unknown",
+	})
+	if !failed {
+		t.Fatal("expected the failed terminal event past the oversized record to be reported")
+	}
+	if !strings.Contains(detail, "boom after the oversized record") {
+		t.Errorf("detail should carry the diagnostic, got %q", detail)
+	}
+}
+
 // TestScanKimiMainTurnFailureWithoutWireLog: no session directory (scan ran
 // before kimi wrote anything, or the home is unset) must be a no-op.
 func TestScanKimiMainTurnFailureWithoutWireLog(t *testing.T) {
@@ -1673,8 +1735,8 @@ func TestScanKimiMainTurnFailureWithoutWireLog(t *testing.T) {
 // layer answers session/prompt successfully (end_turn) after emitting real
 // narration, while kimi's own wire log records the main turn as failed with
 // a bare OAuthConnectionError that matches no stderr sniffer signature.
-func fakeKimiWireTurnFailureScript() string {
-	return `#!/bin/sh
+func fakeKimiWireTurnFailureScript(sessionID string) string {
+	script := `#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
@@ -1697,6 +1759,7 @@ while IFS= read -r line; do
   esac
 done
 `
+	return strings.ReplaceAll(script, "ses_wirefail", sessionID)
 }
 
 // TestKimiBackendWireTurnFailureFailsCompletedRun is the end-to-end guard for
@@ -1709,7 +1772,7 @@ func TestKimiBackendWireTurnFailureFailsCompletedRun(t *testing.T) {
 
 	home := t.TempDir()
 	fakePath := filepath.Join(t.TempDir(), "kimi")
-	writeTestExecutable(t, fakePath, []byte(fakeKimiWireTurnFailureScript()))
+	writeTestExecutable(t, fakePath, []byte(fakeKimiWireTurnFailureScript("ses_wirefail")))
 
 	backend, err := New("kimi", Config{
 		ExecutablePath: fakePath,
@@ -1748,6 +1811,64 @@ func TestKimiBackendWireTurnFailureFailsCompletedRun(t *testing.T) {
 		}
 		if result.ResumeRejected {
 			t.Error("an OAuth transport failure is not a poisoned history; ResumeRejected must stay false")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// TestKimiBackendWireTurnFailurePastOversizedRecord reproduces the review's
+// offline repro on #9057: a valid context.append record at the scan's 32 MiB
+// bound sits ahead of the failed agent.turn.ended record. With the old
+// scanner loop — which stops for good at an over-bound line and never checks
+// scanner.Err() — the backend reported Status="completed", Error="".
+func TestKimiBackendWireTurnFailurePastOversizedRecord(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "wd_test_abc123", "ses_big", "agents", "main")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir wire log dir: %v", err)
+	}
+	oversized := `{"type":"context.append","content":"` + strings.Repeat("x", agentStreamMaxLineBytes) + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "wire.jsonl"), []byte(oversized+"\n"), 0o644); err != nil {
+		t.Fatalf("write oversized record: %v", err)
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "kimi")
+	writeTestExecutable(t, fakePath, []byte(fakeKimiWireTurnFailureScript("ses_big")))
+
+	backend, err := New("kimi", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"KIMI_CODE_HOME": home},
+	})
+	if err != nil {
+		t.Fatalf("new kimi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed past the oversized record, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Error, "OAuthConnectionError") {
+			t.Errorf("expected kimi's diagnostic in the error, got %q", result.Error)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for result")

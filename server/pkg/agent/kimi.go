@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -825,6 +827,9 @@ func scanKimiMainTurnFailure(scan kimiUsageScan) (string, bool) {
 // kimiWireTurnFailure walks one wire log for a failed main turn. A malformed
 // or truncated line is skipped: the log is appended to live, so reporting
 // what is readable beats failing the scan (same policy as the usage scan).
+// A record beyond the scan bound is discarded rather than ending the walk —
+// an oversized context.append ahead of the terminal event must not hide the
+// failed outcome (review on #9057).
 func kimiWireTurnFailure(path string, scan kimiUsageScan) (string, bool) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -834,22 +839,35 @@ func kimiWireTurnFailure(path string, scan kimiUsageScan) (string, bool) {
 
 	detail := ""
 	found := false
-	scanner := newAgentStreamScanner(file)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if !bytes.Contains(line, []byte(kimiTurnEndedRecordType)) {
-			continue
+	reader := bufio.NewReaderSize(file, agentStreamInitialBufferBytes)
+	for {
+		line, err := readAgentStreamLine(reader)
+		if err != nil && !errors.Is(err, bufio.ErrTooLong) && !errors.Is(err, io.EOF) {
+			// Any other read failure ends the walk; the records read so
+			// far are the answer (same best-effort policy as a truncated
+			// tail above).
+			break
 		}
-		var record kimiWireTurnEnd
-		if err := json.Unmarshal(line, &record); err != nil || record.Type != kimiTurnEndedRecordType {
-			continue
+		if line != nil && bytes.Contains(line, []byte(kimiTurnEndedRecordType)) {
+			var record kimiWireTurnEnd
+			if err := json.Unmarshal(line, &record); err != nil || record.Type != kimiTurnEndedRecordType {
+				continue
+			}
+			if !kimiWireRecordInTurn(record.Time, scan.startTime, scan.resumed) {
+				continue
+			}
+			if record.Outcome == "failed" {
+				// kimi's diagnostic is provider-authored text: a JSON
+				// credential in it (request={"api_key":...}) survives both
+				// the raw string and the shared redact.Text, so it takes
+				// the same sanitize pass as every child-process diagnostic
+				// before this reaches Result.Error (review on #9057).
+				detail = sanitizeAgentDiagnostic(record.ErrorMessage)
+				found = true
+			}
 		}
-		if !kimiWireRecordInTurn(record.Time, scan.startTime, scan.resumed) {
-			continue
-		}
-		if record.Outcome == "failed" {
-			detail = record.ErrorMessage
-			found = true
+		if errors.Is(err, io.EOF) {
+			break
 		}
 	}
 	return detail, found
