@@ -163,7 +163,14 @@ type localDirectoryRef struct {
 // Returns true to proceed; on false the 422 response has already been written,
 // using the same daemon_version_unsupported code as the quick-create gate so
 // clients can branch on it.
-func (h *Handler) requireWorktreeCapableDaemon(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, resourceType string, normalizedRef json.RawMessage) bool {
+//
+// Queries arrive as a parameter rather than off the handler: the update path
+// calls this while its transaction holds the resource row lock, and a
+// handler-level read would borrow a second connection from the pool for every
+// locked request — enough concurrent updates would drain the pool into
+// deadlock. Passing the caller's queries (the transaction there, the pool on
+// tx-free create paths) keeps every read on one connection.
+func requireWorktreeCapableDaemon(w http.ResponseWriter, r *http.Request, q *db.Queries, workspaceID pgtype.UUID, resourceType string, normalizedRef json.RawMessage) bool {
 	if resourceType != "local_directory" {
 		return true
 	}
@@ -175,7 +182,7 @@ func (h *Handler) requireWorktreeCapableDaemon(w http.ResponseWriter, r *http.Re
 	// One machine hosts one runtime row per provider, all registered by the
 	// same daemon binary. A workspace has a handful of runtimes; the unfiltered
 	// list is a tiny read.
-	runtimes, err := h.Queries.ListAgentRuntimes(r.Context(), workspaceID)
+	runtimes, err := q.ListAgentRuntimes(r.Context(), workspaceID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to check runtime capabilities")
 		return false
@@ -569,7 +576,7 @@ func (h *Handler) CreateProjectResource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if conflict, err := h.findLocalDirectoryConflict(r.Context(), project.ID, req.ResourceType, normalizedRef, pgtype.UUID{}); err != nil {
+	if conflict, err := findLocalDirectoryConflict(r.Context(), h.Queries, project.ID, req.ResourceType, normalizedRef, pgtype.UUID{}); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to check existing resources")
 		return
 	} else if conflict {
@@ -577,7 +584,7 @@ func (h *Handler) CreateProjectResource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if !h.requireWorktreeCapableDaemon(w, r, project.WorkspaceID, req.ResourceType, normalizedRef) {
+	if !requireWorktreeCapableDaemon(w, r, h.Queries, project.WorkspaceID, req.ResourceType, normalizedRef) {
 		return
 	}
 
@@ -690,7 +697,11 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 		nextRef = normalized
 	}
 
-	if conflict, err := h.findLocalDirectoryConflict(r.Context(), project.ID, existing.ResourceType, nextRef, existing.ID); err != nil {
+	// Both checks read through the transaction (qtx) rather than the handler's
+	// pool queries: this request holds the resource row lock until commit, and
+	// a pool-level read would borrow a second connection per locked request,
+	// draining the pool under enough concurrent updates.
+	if conflict, err := findLocalDirectoryConflict(r.Context(), qtx, project.ID, existing.ResourceType, nextRef, existing.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to check existing resources")
 		return
 	} else if conflict {
@@ -711,7 +722,7 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 	// after the mode was legitimately saved. The row already says worktree; the
 	// claim gate is what stops it from running somewhere that cannot.
 	if refProvided && !refRenameOnly {
-		if !h.requireWorktreeCapableDaemon(w, r, project.WorkspaceID, existing.ResourceType, nextRef) {
+		if !requireWorktreeCapableDaemon(w, r, qtx, project.WorkspaceID, existing.ResourceType, nextRef) {
 			return
 		}
 	}
@@ -841,7 +852,12 @@ func (h *Handler) UpdateProjectResource(w http.ResponseWriter, r *http.Request) 
 // through. We do the daemon-scoped check here in application code instead.
 //
 // `excludeID` lets the update path ignore the row being edited.
-func (h *Handler) findLocalDirectoryConflict(ctx context.Context, projectID pgtype.UUID, resourceType string, normalizedRef json.RawMessage, excludeID pgtype.UUID) (bool, error) {
+//
+// Like requireWorktreeCapableDaemon, the read goes through the passed queries
+// so the update path can run it on its transaction: a handler-level read while
+// the transaction holds the row lock would borrow a second pooled connection
+// per locked request.
+func findLocalDirectoryConflict(ctx context.Context, q *db.Queries, projectID pgtype.UUID, resourceType string, normalizedRef json.RawMessage, excludeID pgtype.UUID) (bool, error) {
 	if resourceType != "local_directory" {
 		return false, nil
 	}
@@ -849,7 +865,7 @@ func (h *Handler) findLocalDirectoryConflict(ctx context.Context, projectID pgty
 	if err := json.Unmarshal(normalizedRef, &incoming); err != nil {
 		return false, err
 	}
-	rows, err := h.Queries.ListProjectResources(ctx, projectID)
+	rows, err := q.ListProjectResources(ctx, projectID)
 	if err != nil {
 		return false, err
 	}

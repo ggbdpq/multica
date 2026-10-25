@@ -16,8 +16,8 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// Pin only the resource read to a known backend. Other queries still use the
-// pool, as they do in production, including queries outside the transaction.
+// Reserve the resource-read backend for the entire request, including the
+// unlocked implementation: releasing it after Scan would allow PID reuse.
 type resourceReadPauseDB struct {
 	db.DBTX
 	resourceDB      db.DBTX
@@ -42,57 +42,86 @@ type resourceReadPauseStarter struct {
 
 func (s resourceReadPauseStarter) Begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := s.conn.Begin(ctx)
-	if err != nil {
-		return nil, err
+	if err != nil || s.paused == nil {
+		return tx, err
 	}
-	return &resourceReadPauseTx{Tx: tx, paused: s.paused, release: s.release}, nil
+	return &contextLockTestTx{Tx: tx, starter: &contextLockTestStarter{
+		pauseAfter: "GetProjectResourceInWorkspaceForUpdate",
+		paused:     s.paused, release: s.release,
+	}}, nil
 }
 
-type resourceReadPauseTx struct {
-	pgx.Tx
-	paused, release chan struct{}
+type resourceUpdateRequest struct {
+	started, done chan struct{}
+	pid           uint32
+	response      *testutil.Response
+	err           error
 }
 
-func (tx *resourceReadPauseTx) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
-	return (resourceReadPauseDB{
-		DBTX: tx.Tx, resourceDB: tx.Tx, paused: tx.paused, release: tx.release,
-	}).QueryRow(ctx, query, args...)
+func startResourceUpdate(t *testing.T, ctx context.Context, req *http.Request, paused, release chan struct{}) *resourceUpdateRequest {
+	t.Helper()
+	result := &resourceUpdateRequest{started: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(result.done)
+		result.err = testPool.AcquireFunc(ctx, func(conn *pgxpool.Conn) error {
+			result.pid = conn.Conn().PgConn().PID()
+			close(result.started)
+			h := *testHandler
+			h.Queries = db.New(resourceReadPauseDB{
+				DBTX: testPool, resourceDB: conn, paused: paused, release: release,
+			})
+			h.TxStarter = resourceReadPauseStarter{conn: conn, paused: paused, release: release}
+			result.response = testutil.Call(t, h.UpdateProjectResource, req)
+			return nil
+		})
+	}()
+	return result
 }
 
-// Wait for evidence that B has progressed while A is paused. With an unlocked
-// read, B finishes first, forcing A to write its stale snapshot last. With a
-// locked read, PostgreSQL must identify B as waiting on A before A is released.
-// Merely observing B before its SELECT would still allow it to read after A.
-func waitForResourceUpdateCompetitor(t *testing.T, ctx context.Context, holderPID, waiterPID uint32, done <-chan struct{}) {
+func resourceUpdatePID(t *testing.T, ctx context.Context, request *resourceUpdateRequest) uint32 {
+	t.Helper()
+	select {
+	case <-request.started:
+		return request.pid
+	case <-request.done:
+		if request.err != nil {
+			t.Fatalf("acquire resource update connection: %v", request.err)
+		}
+		return request.pid
+	case <-ctx.Done():
+		t.Fatalf("resource update did not acquire connection: %v", ctx.Err())
+		return 0
+	}
+}
+
+// The request connections remain reserved while this is observed. A matching
+// SQL name alone could refer to another resource, database, or test run.
+func refRequestGated(ctx context.Context, holderPID, waiterPID uint32, done <-chan struct{}) (bool, error) {
+	select {
+	case <-done:
+		return true, nil
+	default:
+	}
+	var blocked bool
+	err := testPool.QueryRow(ctx, `SELECT $1::int = ANY(pg_blocking_pids($2::int))`,
+		int(holderPID), int(waiterPID)).Scan(&blocked)
+	return blocked, err
+}
+
+func waitRefRequestGated(t *testing.T, ctx context.Context, holderPID, waiterPID uint32, done <-chan struct{}) {
 	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		select {
-		case <-done:
-			t.Log("ref update completed while label update was paused")
-			return
-		default:
+		ready, err := refRequestGated(ctx, holderPID, waiterPID, done)
+		if err != nil {
+			t.Fatalf("observe resource update backends %d -> %d: %v", holderPID, waiterPID, err)
 		}
-		var blocked bool
-		if err := testPool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM pg_stat_activity
-				WHERE datname = current_database() AND pid = $2
-				  AND state = 'active' AND wait_event_type = 'Lock'
-				  AND wait_event IN ('transactionid', 'tuple')
-				  AND $1::int = ANY(pg_blocking_pids(pid))
-			)
-		`, int(holderPID), int(waiterPID)).Scan(&blocked); err != nil {
-			t.Fatalf("observe competing resource update: %v", err)
-		}
-		if blocked {
-			t.Log("ref update is blocked by label update's PostgreSQL backend")
+		if ready {
 			return
 		}
 		select {
 		case <-done:
-			t.Log("ref update completed while label update was paused")
 			return
 		case <-ctx.Done():
 			t.Fatalf("ref update neither completed nor blocked on label update: %v", ctx.Err())
@@ -101,149 +130,175 @@ func waitForResourceUpdateCompetitor(t *testing.T, ctx context.Context, holderPI
 	}
 }
 
-// A label-only request must preserve a racing ref update, including the
-// local_directory execution mode and its legacy label mirror (#9238).
+func runConcurrentPartialUpdate(t *testing.T, ctx context.Context, projectID, resourceID string, refBody map[string]any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	paused, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	resume := func() { releaseOnce.Do(func() { close(release) }) }
+	var requestA, requestB *resourceUpdateRequest
+	defer func() {
+		resume()
+		cancel()
+		for _, request := range []*resourceUpdateRequest{requestA, requestB} {
+			if request == nil {
+				continue
+			}
+			select {
+			case <-request.done:
+			case <-time.After(5 * time.Second):
+				t.Error("resource update did not stop after cancellation")
+			}
+		}
+	}()
+
+	path := "/api/projects/" + projectID + "/resources/" + resourceID
+	reqA := withURLParams(newRequest("PUT", path, map[string]any{"label": "New label"}).WithContext(ctx),
+		"id", projectID, "resourceId", resourceID)
+	requestA = startResourceUpdate(t, ctx, reqA, paused, release)
+	pidA := resourceUpdatePID(t, ctx, requestA)
+	select {
+	case <-paused:
+	case <-requestA.done:
+		t.Fatalf("label update ended before reading resource: error=%v, response=%v", requestA.err, requestA.response)
+	case <-ctx.Done():
+		t.Fatalf("label update did not read resource: %v", ctx.Err())
+	}
+
+	reqB := withURLParams(newRequest("PUT", path, map[string]any{"resource_ref": refBody}).WithContext(ctx),
+		"id", projectID, "resourceId", resourceID)
+	requestB = startResourceUpdate(t, ctx, reqB, nil, nil)
+	pidB := resourceUpdatePID(t, ctx, requestB)
+	waitRefRequestGated(t, ctx, pidA, pidB, requestB.done)
+	resume()
+	for _, request := range []*resourceUpdateRequest{requestA, requestB} {
+		select {
+		case <-request.done:
+		case <-ctx.Done():
+			t.Fatalf("resource update did not complete: %v", ctx.Err())
+		}
+		if request.err != nil {
+			t.Fatalf("resource update connection: %v", request.err)
+		}
+		request.response.Want(http.StatusOK)
+	}
+}
+
+// storedProjectResource reads the row back after both updates settled.
+func storedProjectResource(t *testing.T, ctx context.Context, resourceID string) db.ProjectResource {
+	t.Helper()
+	stored, err := testHandler.Queries.GetProjectResourceInWorkspace(ctx, db.GetProjectResourceInWorkspaceParams{
+		ID: parseUUID(resourceID), WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stored
+}
+
+// Omitted columns must survive a competing ref update (#9238).
 func TestUpdateProjectResourceConcurrentPartialUpdate(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Fatal("database-backed handler test fixture is required")
 	}
-	for _, resourceType := range []string{"github_repo", "local_directory"} {
-		t.Run(resourceType, func(t *testing.T) {
-			projectID := dbfx.Project(t, "racing project")
-			initialRef := map[string]any{"url": "https://github.com/example/repo", "ref": "main"}
-			nextRef := map[string]any{"url": "https://github.com/example/repo", "ref": "release"}
-			wantRef := map[string]string{"url": "https://github.com/example/repo", "ref": "release"}
-			if resourceType == "local_directory" {
-				daemonID := "resource-update-" + projectID
+
+	ctx := context.Background()
+	projectID := dbfx.Project(t, "racing project")
+	resourceID := dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id":    projectID,
+		"workspace_id":  testWorkspaceID,
+		"resource_type": "github_repo",
+		"resource_ref":  `{"url":"https://github.com/example/repo","ref":"main"}`,
+		"label":         "Old label",
+		"position":      1,
+	})
+
+	runConcurrentPartialUpdate(t, ctx, projectID, resourceID, map[string]any{
+		"url": "https://github.com/example/repo", "ref": "release",
+	})
+
+	stored := storedProjectResource(t, ctx, resourceID)
+	var ref struct {
+		Ref string `json:"ref"`
+	}
+	if err := json.Unmarshal(stored.ResourceRef, &ref); err != nil {
+		t.Fatalf("stored ref %s: %v", stored.ResourceRef, err)
+	}
+	if ref.Ref != "release" {
+		t.Errorf("stored ref = %q, want the concurrent ref update (release)", ref.Ref)
+	}
+	if !stored.Label.Valid || stored.Label.String != "New label" {
+		t.Errorf("stored label = %v, want New label", stored.Label)
+	}
+	if stored.Position != 1 {
+		t.Errorf("stored position = %d, want 1", stored.Position)
+	}
+}
+
+// The legacy label mirror must not revert a competing execution-mode change.
+func TestUpdateProjectResourceConcurrentLabelMirrorVsExecutionMode(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Fatal("database-backed handler test fixture is required")
+	}
+	for _, tc := range []struct {
+		name, initialMode, nextMode string
+	}{
+		{"worktree_to_in_place", "worktree", ""},
+		{"in_place_to_worktree", "in_place", "worktree"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			projectID := dbfx.Project(t, "racing local directory project")
+			daemonID := "resource-update-" + projectID
+			if tc.nextMode == "worktree" {
 				metadata, err := json.Marshal(map[string]any{
 					"capabilities": []string{protocol.DaemonCapabilityLocalWorktreeV1},
 				})
 				if err != nil {
 					t.Fatal(err)
 				}
-				dbfx.Runtime(t, "resource update worktree runtime", testutil.Cols{
+				dbfx.Runtime(t, "worktree-capable resource runtime", testutil.Cols{
 					"daemon_id": daemonID, "runtime_mode": "local", "metadata": string(metadata),
 				})
-				initialRef = map[string]any{
-					"local_path": "/tmp/resource-update-project", "daemon_id": daemonID,
-					"execution_mode": "in_place", "label": "Old label",
-				}
-				// A mode dialog may carry the embedded label it originally read.
-				nextRef = map[string]any{
-					"local_path": "/tmp/resource-update-project", "daemon_id": daemonID,
-					"execution_mode": "worktree", "label": "Old label",
-				}
-				wantRef = map[string]string{
-					"local_path": "/tmp/resource-update-project", "daemon_id": daemonID,
-					"execution_mode": "worktree", "label": "New label",
-				}
 			}
-			refJSON, err := json.Marshal(initialRef)
+			initialRef, err := json.Marshal(map[string]any{
+				"local_path": "/repo", "daemon_id": daemonID,
+				"execution_mode": tc.initialMode, "label": "Old label",
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			resourceID := dbfx.Insert(t, "project_resource", testutil.Cols{
 				"project_id": projectID, "workspace_id": testWorkspaceID,
-				"resource_type": resourceType, "resource_ref": string(refJSON),
+				"resource_type": "local_directory", "resource_ref": string(initialRef),
 				"label": "Old label", "position": 1,
 			})
-
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			startedA, startedB := false, false
-			connA, err := testPool.Acquire(ctx)
-			if err != nil {
-				t.Fatal(err)
+			refBody := map[string]any{
+				"local_path": "/repo", "daemon_id": daemonID, "label": "Old label",
 			}
-			defer func() {
-				if !startedA {
-					connA.Release()
-				}
-			}()
-			connB, err := testPool.Acquire(ctx)
-			if err != nil {
-				t.Fatal(err)
+			if tc.nextMode != "" {
+				refBody["execution_mode"] = tc.nextMode
 			}
-			defer func() {
-				if !startedB {
-					connB.Release()
-				}
-			}()
-			pidA, pidB := connA.Conn().PgConn().PID(), connB.Conn().PgConn().PID()
-			paused, release := make(chan struct{}), make(chan struct{})
-			var releaseOnce sync.Once
-			resume := func() { releaseOnce.Do(func() { close(release) }) }
-			hA, hB := *testHandler, *testHandler
-			hA.Queries = db.New(resourceReadPauseDB{
-				DBTX: testPool, resourceDB: connA, paused: paused, release: release,
-			})
-			hA.TxStarter = resourceReadPauseStarter{conn: connA, paused: paused, release: release}
-			hB.Queries = db.New(resourceReadPauseDB{DBTX: testPool, resourceDB: connB})
-			hB.TxStarter = connB
-
-			path := "/api/projects/" + projectID + "/resources/" + resourceID
-			reqA := withURLParams(newRequest("PUT", path, map[string]any{"label": "New label"}).WithContext(ctx),
-				"id", projectID, "resourceId", resourceID)
-			reqB := withURLParams(newRequest("PUT", path, map[string]any{"resource_ref": nextRef}).WithContext(ctx),
-				"id", projectID, "resourceId", resourceID)
-			doneA, doneB := make(chan struct{}), make(chan struct{})
-			var responseA, responseB *testutil.Response
-			defer func() {
-				resume()
-				cancel()
-				for _, done := range []<-chan struct{}{doneA, doneB} {
-					if done == doneB && !startedB {
-						continue
-					}
-					select {
-					case <-done:
-					case <-time.After(5 * time.Second):
-						t.Error("resource update did not stop after cancellation")
-					}
-				}
-			}()
-			startedA = true
-			go func() {
-				defer close(doneA)
-				defer connA.Release()
-				responseA = testutil.Call(t, hA.UpdateProjectResource, reqA)
-			}()
-			waitContextLockSignal(t, paused, "label update did not read resource")
-			startedB = true
-			go func() {
-				defer close(doneB)
-				defer connB.Release()
-				responseB = testutil.Call(t, hB.UpdateProjectResource, reqB)
-			}()
-			waitForResourceUpdateCompetitor(t, ctx, pidA, pidB, doneB)
-			resume()
-			for _, done := range []<-chan struct{}{doneA, doneB} {
-				select {
-				case <-done:
-				case <-ctx.Done():
-					t.Fatalf("resource updates did not complete: %v", ctx.Err())
-				}
+			runConcurrentPartialUpdate(t, ctx, projectID, resourceID, refBody)
+			stored := storedProjectResource(t, ctx, resourceID)
+			var ref struct {
+				ExecutionMode string `json:"execution_mode"`
+				Label         string `json:"label"`
+				LocalPath     string `json:"local_path"`
+				DaemonID      string `json:"daemon_id"`
 			}
-			responseA.Want(http.StatusOK)
-			responseB.Want(http.StatusOK)
-
-			stored, err := testHandler.Queries.GetProjectResourceInWorkspace(ctx, db.GetProjectResourceInWorkspaceParams{
-				ID: parseUUID(resourceID), WorkspaceID: parseUUID(testWorkspaceID),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var ref map[string]string
 			if err := json.Unmarshal(stored.ResourceRef, &ref); err != nil {
 				t.Fatalf("stored ref %s: %v", stored.ResourceRef, err)
 			}
-			for key, want := range wantRef {
-				if ref[key] != want {
-					t.Errorf("stored resource_ref.%s = %q, want %q", key, ref[key], want)
-				}
+			if ref.ExecutionMode != tc.nextMode {
+				t.Errorf("stored execution_mode = %q, want %q", ref.ExecutionMode, tc.nextMode)
 			}
-			if !stored.Label.Valid || stored.Label.String != "New label" {
-				t.Errorf("stored label = %v, want New label", stored.Label)
+			if !stored.Label.Valid || stored.Label.String != "New label" || ref.Label != "New label" {
+				t.Errorf("stored labels = column:%v ref:%q, want both New label", stored.Label, ref.Label)
+			}
+			if ref.LocalPath != "/repo" || ref.DaemonID != daemonID {
+				t.Errorf("stored directory = %q/%q, want /repo/%s", ref.LocalPath, ref.DaemonID, daemonID)
 			}
 			if stored.Position != 1 {
 				t.Errorf("stored position = %d, want 1", stored.Position)

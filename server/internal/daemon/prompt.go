@@ -64,13 +64,29 @@ func perTurnContextBlocks(task Task, opts promptOpts) string {
 	var b strings.Builder
 	b.WriteString(buildSharedLocalDirectoryBlock(opts.sharedLocalDirectory))
 	b.WriteString(buildWorktreeReplayConflictBlock(opts.worktreeReplayConflicts))
+	b.WriteString(buildWorktreeBranchBlock(opts.worktreeBranch, opts.worktreeBase))
 	if task.PriorSessionResumeUnavailable {
 		b.WriteString(sessionContinuityNoticeFor(task))
 	}
 	b.WriteString(execenv.BuildOnBehalfOfBlock(task.InitiatorName, task.InitiatorEmail))
 	b.WriteString(execenv.BuildConnectedAppsBlock(task.ConnectedApps))
 	b.WriteString(buildJoinedWakeupsBlock(task.WakeupJoined))
+	b.WriteString(buildProjectWorkflowBlock(task))
 	return b.String()
+}
+
+// buildProjectWorkflowBlock carries the issue's project workflow and current
+// step (MUL-7420). It varies by project and by step, so it lives here and not
+// in the cached brief (MUL-5377).
+func buildProjectWorkflowBlock(task Task) string {
+	if task.ProjectWorkflow == nil {
+		return ""
+	}
+	brief := strings.TrimSpace(task.ProjectWorkflow.Brief)
+	if brief == "" {
+		return ""
+	}
+	return "[Project workflow]\n" + brief + "\n\n"
 }
 
 // buildJoinedWakeupsBlock carries wakeups that fired while this run was
@@ -89,6 +105,8 @@ func buildJoinedWakeupsBlock(notes string) string {
 type promptOpts struct {
 	sharedLocalDirectory    bool
 	worktreeReplayConflicts []string
+	worktreeBranch          string
+	worktreeBase            string
 }
 
 // PromptOption tunes per-turn prompt copy with run-scoped context.
@@ -112,6 +130,60 @@ func WithSharedLocalDirectory() PromptOption {
 // resolves it (MUL-6881).
 func WithWorktreeReplayConflicts(files []string) PromptOption {
 	return func(o *promptOpts) { o.worktreeReplayConflicts = files }
+}
+
+// WithWorktreeBranch names the task branch a worktree-mode turn delivers on and
+// the commit it started from. The daemon refuses to record a delivery that is
+// not on that branch or no longer contains that commit (MUL-6881), and nothing
+// inside the worktree tells the agent so — squashing or switching branches is
+// ordinary git hygiene it would otherwise reach for (#9404).
+func WithWorktreeBranch(branch, base string) PromptOption {
+	return func(o *promptOpts) {
+		o.worktreeBranch = branch
+		o.worktreeBase = base
+	}
+}
+
+// buildWorktreeBranchBlock states the delivery contract of a worktree turn.
+// Branch names come from the daemon's own sanitised naming and the base is a
+// hex object id, so both are safe to render in code spans.
+func buildWorktreeBranchBlock(branch, base string) string {
+	if branch == "" || base == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Your task branch\n\n")
+	fmt.Fprintf(&b, "This run works in a private git worktree on branch `%s`, starting from commit `%s`. What that branch holds when you finish is what gets delivered, and the next turn continues from it.\n\n", branch, base)
+	fmt.Fprintf(&b, "- Keep HEAD on `%s` and only add commits on top of `%s`. Do not squash, amend, rebase or reset past `%s`, and do not check out another branch or a detached HEAD to do the work.\n", branch, base, base)
+	b.WriteString("- To publish the work under another name (for a pull request), push it without switching: `git push origin HEAD:<name>`.\n")
+	b.WriteString("- A delivery that is not on this branch, or no longer contains its starting commit, cannot be recorded: the task fails even though the work is done.\n\n")
+	return b.String()
+}
+
+// BuildWorktreeDeliveryRepairPrompt is the follow-up turn the daemon runs when
+// the agent finished with its work somewhere Finalize would refuse to record.
+// It is self-contained — the backend may not be able to resume the session, so
+// nothing here may depend on the agent remembering the turn it just ran.
+func BuildWorktreeDeliveryRepairPrompt(problem *execenv.DeliveryProblem) string {
+	var b strings.Builder
+	b.WriteString("Your previous turn in this git worktree finished, but its work cannot be delivered yet.\n\n")
+	fmt.Fprintf(&b, "Problem: %s.\n\n", problem.Reason)
+	fmt.Fprintf(&b, "The work has to end on branch `%s`, in commits on top of `%s` (the commit this turn started from), with HEAD on that branch. Your files are intact; only where they are committed is wrong.\n\n", problem.Branch, problem.BaseCommit)
+	b.WriteString("Fix it in this worktree. This sequence keeps every file exactly as it is now and puts it on the branch as one commit:\n\n```sh\n")
+	for _, step := range problem.RepairSteps() {
+		b.WriteString("git")
+		for _, arg := range step {
+			if strings.ContainsAny(arg, " '\"") {
+				arg = "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+			}
+			b.WriteString(" " + arg)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("```\n\n")
+	fmt.Fprintf(&b, "Before the final commit, check `git diff --cached %s`: it should show only the changes you meant to make. If it undoes something `%s` contains that you did not intend to remove, restore it first. You may keep separate commits instead (for example by rebasing them onto `%s`), as long as the end state is the same.\n\n", problem.BaseCommit, problem.BaseCommit, problem.BaseCommit)
+	b.WriteString("Do only this — no other changes, no new comments or status updates. Reply with one line saying what you did.\n")
+	return b.String()
 }
 
 // buildSharedLocalDirectoryBlock warns an unlocked turn that its working
@@ -245,7 +317,10 @@ func buildPromptBody(task Task, provider string) string {
 	// per-turn prompt rather than the cached runtime brief (MUL-5377).
 	if task.HandoffNote != "" {
 		b.WriteString("You were handed this issue with a handoff note. Treat it as the assigner's scoping instruction for this run; follow it before doing anything broader, and do not reply to it as if it were a comment:\n\n")
-		fmt.Fprintf(&b, "> %s\n\n", task.HandoffNote)
+		for _, line := range strings.Split(strings.TrimSpace(task.HandoffNote), "\n") {
+			fmt.Fprintf(&b, "> %s\n", line)
+		}
+		b.WriteString("\n")
 	}
 	fmt.Fprintf(&b, "Start by running `multica issue get %s --output json` to understand your task, then complete it.\n", task.IssueID)
 	// Workflow step 2 owns the catch-up rule for every issue turn; this line
