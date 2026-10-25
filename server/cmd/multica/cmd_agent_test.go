@@ -185,6 +185,43 @@ func TestRunAgentTasksJSONWithCursorNullOnLastPage(t *testing.T) {
 	}
 }
 
+// Contract: an empty page under --with-cursor still emits the wrapper object
+// ({"tasks": [], "next_cursor": null}), never a bare [] that scripts cannot
+// tell apart from a truncated unwrapped page.
+func TestRunAgentTasksJSONWithCursorEmptyPage(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("MULTICA_AGENT_ID", "")
+	t.Setenv("MULTICA_TASK_ID", "")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	setCLITestServerEnv(t, srv.URL)
+
+	cmd := newAgentTasksTestCmd()
+	if err := cmd.Flags().Set("with-cursor", "true"); err != nil {
+		t.Fatal(err)
+	}
+	output, err := captureStdout(t, func() error { return runAgentTasks(cmd, []string{"agent-123"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page struct {
+		Tasks      []map[string]any `json:"tasks"`
+		NextCursor *string          `json:"next_cursor"`
+	}
+	if err := json.Unmarshal([]byte(output), &page); err != nil {
+		t.Fatalf("stdout must be the wrapper object: %s", output)
+	}
+	if len(page.Tasks) != 0 {
+		t.Fatalf("tasks = %v, want empty", page.Tasks)
+	}
+	if page.NextCursor != nil {
+		t.Fatalf("next_cursor = %v, want null on an empty page", *page.NextCursor)
+	}
+}
+
 func TestRunAgentTasksKeepsTableRequestLightweight(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("MULTICA_AGENT_ID", "")
