@@ -26,6 +26,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/agent"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 	"github.com/pelletier/go-toml/v2"
+	"gopkg.in/yaml.v3"
 )
 
 func createDaemonTestRepo(t *testing.T) string {
@@ -399,6 +400,80 @@ func TestConfigureCodexTaskShellEnvironment(t *testing.T) {
 		err := configureCodexTaskShellEnvironment("codex", "", nil, map[string]string{"MULTICA_TOKEN": "mat_task"}, nil, slog.Default())
 		if err == nil || !strings.Contains(err.Error(), "CODEX_HOME is missing") {
 			t.Fatalf("error = %v, want missing CODEX_HOME", err)
+		}
+	})
+}
+
+func TestConfigureHermesTaskShellEnvironment(t *testing.T) {
+	t.Parallel()
+
+	t.Run("non-Hermes runtime is unchanged", func(t *testing.T) {
+		t.Parallel()
+		hermesHome := t.TempDir()
+		if err := configureHermesTaskShellEnvironment("codex", hermesHome, map[string]string{"MULTICA_TOKEN": "mat_task"}, slog.Default()); err != nil {
+			t.Fatalf("configureHermesTaskShellEnvironment: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(hermesHome, "config.yaml")); !os.IsNotExist(err) {
+			t.Fatalf("non-Hermes runtime unexpectedly wrote config.yaml: %v", err)
+		}
+	})
+
+	t.Run("Hermes overlay config gains the task MULTICA_* passthrough", func(t *testing.T) {
+		t.Parallel()
+		hermesHome := t.TempDir()
+		configPath := filepath.Join(hermesHome, "config.yaml")
+		// The shape writeDerivedHermesConfig produces: user settings preserved,
+		// plus an operator terminal.env_passthrough entry that must survive.
+		if err := os.WriteFile(configPath, []byte("skills:\n  external_dirs:\n    - /shared/.hermes/skills\nterminal:\n  env_passthrough:\n    - USER_TOOL_TOKEN\n"), 0o600); err != nil {
+			t.Fatalf("seed config.yaml: %v", err)
+		}
+		agentEnv := map[string]string{
+			"MULTICA_TOKEN":                "mat_task",
+			"MULTICA_TASK_ID":              "task-1",
+			"MULTICA_TASK_CONFIG_ROOT":     "/task/multica-config",
+			"MULTICA_TASK_WORKSPACES_ROOT": "/workspaces",
+			"MULTICA_SERVER_URL":           "https://task.example",
+			"HOME":                         "/home/daemon-user",
+		}
+		if err := configureHermesTaskShellEnvironment("hermes", hermesHome, agentEnv, slog.Default()); err != nil {
+			t.Fatalf("configureHermesTaskShellEnvironment: %v", err)
+		}
+
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("read config.yaml: %v", err)
+		}
+		var parsed struct {
+			Terminal struct {
+				EnvPassthrough []string `yaml:"env_passthrough"`
+			} `yaml:"terminal"`
+		}
+		if err := yaml.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("parse config.yaml: %v\n%s", err, data)
+		}
+		got := parsed.Terminal.EnvPassthrough
+		if !slices.Contains(got, "USER_TOOL_TOKEN") {
+			t.Errorf("operator entry USER_TOOL_TOKEN dropped: %v", got)
+		}
+		for _, want := range []string{"MULTICA_TOKEN", "MULTICA_TASK_ID", "MULTICA_TASK_CONFIG_ROOT", "MULTICA_TASK_WORKSPACES_ROOT", "MULTICA_SERVER_URL"} {
+			if !slices.Contains(got, want) {
+				t.Errorf("terminal.env_passthrough missing %q, got %v", want, got)
+			}
+		}
+		if slices.Contains(got, "HOME") {
+			t.Errorf("terminal.env_passthrough must not include HOME, got %v", got)
+		}
+		if strings.Contains(string(data), "mat_task") {
+			t.Errorf("config.yaml contains the token value:\n%s", data)
+		}
+	})
+
+	t.Run("Hermes without task overlay keeps the user home untouched", func(t *testing.T) {
+		t.Parallel()
+		// A skill-less Hermes task keeps the user's real HERMES_HOME; the
+		// shared home is never written, so this is a no-op, not an error.
+		if err := configureHermesTaskShellEnvironment("hermes", "", map[string]string{"MULTICA_TOKEN": "mat_task"}, slog.Default()); err != nil {
+			t.Fatalf("configureHermesTaskShellEnvironment: %v", err)
 		}
 	})
 }

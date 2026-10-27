@@ -8657,6 +8657,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
 		return TaskResult{}, err
 	}
+	if err := configureHermesTaskShellEnvironment(provider, env.HermesHome, agentEnv, d.logger); err != nil {
+		return TaskResult{}, err
+	}
 	// The overlay is authoritative once built, so nothing on the command line
 	// may re-point HERMES_HOME out of it. Both argv regions are stripped
 	// together, against the same assembled argv the resolver read: a selection
@@ -10873,6 +10876,35 @@ func configureCodexTaskShellEnvironment(provider, codexHome string, inherited []
 	configPath := filepath.Join(codexHome, "config.toml")
 	if err := execenv.EnsureCodexShellEnvPolicyConfig(configPath, includeOnly, logger); err != nil {
 		return fmt.Errorf("configure Codex shell environment: %w", err)
+	}
+	return nil
+}
+
+// configureHermesTaskShellEnvironment mirrors configureCodexTaskShellEnvironment
+// for Hermes runtimes. Hermes scrubs tool subprocess shells (terminal,
+// execute_code, background spawns) against its provider-credential blocklist,
+// and only names registered for passthrough reach those children — so the
+// task-scoped MULTICA_* variables the daemon injected into the Hermes main
+// process can vanish from `multica issue ...` inside a tool shell (issue #9587,
+// the Hermes twin of #9438). The daemon appends those names to
+// terminal.env_passthrough in the task-local overlay config; Hermes resolves
+// each name's value from the child process environment, so the config holds
+// names only. The overlay is also the only safe target: env.HermesHome is empty
+// for a skill-less Hermes task, which keeps the user's real home, and the
+// shared home is never written — such tasks are skipped, not failed.
+// Failure is fatal: launching against an overlay whose config could not be
+// amended drops the task-scoped token again.
+func configureHermesTaskShellEnvironment(provider, hermesHome string, agentEnv map[string]string, logger *slog.Logger) error {
+	if provider != "hermes" || strings.TrimSpace(hermesHome) == "" {
+		return nil
+	}
+	names := execenv.HermesShellEnvPassthrough(agentEnv)
+	if len(names) == 0 {
+		return nil
+	}
+	configPath := filepath.Join(hermesHome, "config.yaml")
+	if err := execenv.EnsureHermesShellEnvPassthrough(configPath, names, logger); err != nil {
+		return fmt.Errorf("configure Hermes shell environment: %w", err)
 	}
 	return nil
 }
